@@ -27,6 +27,10 @@ def format_kst(dt=None):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# =========================
+# 포맷
+# =========================
+
 def format_price(value, market):
     try:
         value = float(value)
@@ -97,6 +101,10 @@ def format_market_cap(value, market):
         return format_korean_money(value)
     return format_usd_money(value)
 
+
+# =========================
+# 종목 검색 / 데이터
+# =========================
 
 @st.cache_data(ttl=3600)
 def get_krx_listing():
@@ -187,6 +195,10 @@ def filter_range(df, candle, period):
     return df
 
 
+# =========================
+# 지표
+# =========================
+
 def add_indicators(df):
     df = df.copy()
 
@@ -225,10 +237,69 @@ def add_indicators(df):
 
     df["ATR"] = tr.rolling(14).mean()
 
+    df["OBV"] = 0.0
+    for i in range(1, len(df)):
+        if df["Close"].iloc[i] > df["Close"].iloc[i - 1]:
+            df.iloc[i, df.columns.get_loc("OBV")] = df["OBV"].iloc[i - 1] + df["Volume"].iloc[i]
+        elif df["Close"].iloc[i] < df["Close"].iloc[i - 1]:
+            df.iloc[i, df.columns.get_loc("OBV")] = df["OBV"].iloc[i - 1] - df["Volume"].iloc[i]
+        else:
+            df.iloc[i, df.columns.get_loc("OBV")] = df["OBV"].iloc[i - 1]
+
+    df["VOL_MA20"] = df["Volume"].rolling(20).mean()
+    df["VOL_RATE"] = ((df["Volume"] / df["VOL_MA20"]) - 1) * 100
+
     return df.dropna()
 
 
-def get_score(df):
+# =========================
+# 분석
+# =========================
+
+def analyze_volume(df):
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    total_volume = latest["Volume"]
+    avg_volume = latest["VOL_MA20"]
+    volume_rate = latest["VOL_RATE"]
+
+    if latest["Close"] > prev["Close"]:
+        volume_signal = "매수세 우세 추정"
+        buy_est = total_volume
+        sell_est = 0
+    elif latest["Close"] < prev["Close"]:
+        volume_signal = "매도세 우세 추정"
+        buy_est = 0
+        sell_est = total_volume
+    else:
+        volume_signal = "중립 추정"
+        buy_est = 0
+        sell_est = 0
+
+    obv_now = latest["OBV"]
+    obv_prev = df["OBV"].iloc[-5] if len(df) >= 5 else prev["OBV"]
+
+    if obv_now > obv_prev:
+        obv_signal = "OBV 상승: 거래량 흐름 개선"
+    elif obv_now < obv_prev:
+        obv_signal = "OBV 하락: 거래량 흐름 약화"
+    else:
+        obv_signal = "OBV 보합"
+
+    return {
+        "total_volume": total_volume,
+        "avg_volume": avg_volume,
+        "volume_rate": volume_rate,
+        "buy_est": buy_est,
+        "sell_est": sell_est,
+        "volume_signal": volume_signal,
+        "obv": obv_now,
+        "obv_signal": obv_signal
+    }
+
+
+def get_score(df, financial_score=None, news_score=None):
     latest = df.iloc[-1]
     score = 50
     reasons = []
@@ -273,15 +344,40 @@ def get_score(df):
         score -= 8
         reasons.append("MACD가 Signal 아래에 있어 모멘텀이 약합니다.")
 
-    avg_volume20 = df["Volume"].rolling(20).mean().iloc[-1]
-    if latest["Volume"] > avg_volume20 * 1.5:
+    if latest["Volume"] > latest["VOL_MA20"] * 1.5:
         score += 10
         reasons.append("거래량이 20개 봉 평균보다 크게 증가했습니다.")
-    elif latest["Volume"] > avg_volume20:
+    elif latest["Volume"] > latest["VOL_MA20"]:
         score += 5
         reasons.append("거래량이 평균보다 증가했습니다.")
     else:
         reasons.append("거래량 증가가 약합니다.")
+
+    obv_now = latest["OBV"]
+    obv_prev = df["OBV"].iloc[-5] if len(df) >= 5 else df["OBV"].iloc[-2]
+
+    if obv_now > obv_prev:
+        score += 5
+        reasons.append("OBV가 상승해 거래량 흐름이 개선되고 있습니다.")
+    else:
+        score -= 5
+        reasons.append("OBV가 하락 또는 정체되어 거래량 흐름이 약합니다.")
+
+    if financial_score is not None:
+        if financial_score >= 70:
+            score += 5
+            reasons.append("재무 점수가 양호해 종합 점수에 긍정적으로 반영했습니다.")
+        elif financial_score <= 40:
+            score -= 5
+            reasons.append("재무 점수가 낮아 종합 점수에 부정적으로 반영했습니다.")
+
+    if news_score is not None:
+        if news_score > 0:
+            score += min(news_score, 5)
+            reasons.append("뉴스 분위기가 긍정적으로 나타났습니다.")
+        elif news_score < 0:
+            score += max(news_score, -5)
+            reasons.append("뉴스 분위기가 부정적으로 나타났습니다.")
 
     score = max(0, min(100, score))
 
@@ -367,6 +463,10 @@ def check_alerts(current_price, market, target_price, take_profit_price, stop_lo
     return results
 
 
+# =========================
+# 뉴스
+# =========================
+
 @st.cache_data(ttl=600)
 def load_news(name):
     query = name.replace(" ", "+")
@@ -403,6 +503,39 @@ def summarize_news(title):
     return ["종목 또는 시장 분위기 관련 뉴스입니다.", "제목만으로는 정확한 판단이 어려워 원문 확인이 필요합니다."]
 
 
+def get_news_sentiment(title):
+    positive_words = [
+        "호실적", "상승", "수주", "증가", "흑자", "성장", "목표가 상향",
+        "강세", "기대", "개선", "돌파", "최대", "확대", "계약", "매수"
+    ]
+
+    negative_words = [
+        "하락", "부진", "적자", "감소", "소송", "규제", "목표가 하향",
+        "약세", "우려", "악화", "급락", "축소", "리콜", "매도", "손실"
+    ]
+
+    pos = sum(1 for word in positive_words if word in title)
+    neg = sum(1 for word in negative_words if word in title)
+
+    if pos > neg:
+        return "긍정", "green", 1
+    if neg > pos:
+        return "부정", "red", -1
+    return "중립", "gray", 0
+
+
+def get_news_score(news):
+    total = 0
+    for item in news:
+        _, _, score = get_news_sentiment(item["title"])
+        total += score
+    return total
+
+
+# =========================
+# 재무 / 배당
+# =========================
+
 @st.cache_data(ttl=86400)
 def load_financial(yf_symbol):
     try:
@@ -411,6 +544,56 @@ def load_financial(yf_symbol):
     except Exception:
         return {}
 
+
+def get_financial_score(info):
+    score = 50
+    reasons = []
+
+    per = info.get("trailingPE")
+    pbr = info.get("priceToBook")
+    roe = info.get("returnOnEquity")
+    dividend = info.get("dividendYield")
+
+    if per and per > 0:
+        if per < 10:
+            score += 10
+            reasons.append("PER이 낮아 저평가 가능성이 있습니다.")
+        elif per > 30:
+            score -= 8
+            reasons.append("PER이 높아 고평가 부담이 있습니다.")
+
+    if pbr and pbr > 0:
+        if pbr < 1:
+            score += 8
+            reasons.append("PBR이 1 이하로 자산 대비 저평가 가능성이 있습니다.")
+        elif pbr > 3:
+            score -= 6
+            reasons.append("PBR이 높아 자산 대비 부담이 있습니다.")
+
+    if roe is not None:
+        if roe >= 0.15:
+            score += 10
+            reasons.append("ROE가 높아 수익성이 좋습니다.")
+        elif roe < 0.05:
+            score -= 6
+            reasons.append("ROE가 낮아 수익성이 약합니다.")
+
+    if dividend is not None:
+        if dividend >= 0.03:
+            score += 5
+            reasons.append("배당률이 비교적 양호합니다.")
+
+    score = max(0, min(100, score))
+
+    if not reasons:
+        reasons.append("무료 데이터에서 확인 가능한 재무 정보가 제한적입니다.")
+
+    return score, reasons
+
+
+# =========================
+# 환율
+# =========================
 
 @st.cache_data(ttl=300)
 def load_exchange_data(symbol):
@@ -425,6 +608,10 @@ def load_exchange_data(symbol):
 
     return daily.dropna(), hourly.dropna()
 
+
+# =========================
+# 사이드바
+# =========================
 
 with st.sidebar:
     st.header("검색 설정")
@@ -449,8 +636,6 @@ with st.sidebar:
     alert_target_price = st.number_input("목표가", min_value=0.0, value=0.0, step=100.0)
     alert_take_profit_price = st.number_input("익절가", min_value=0.0, value=0.0, step=100.0)
     alert_stop_loss_price = st.number_input("손절가", min_value=0.0, value=0.0, step=100.0)
-
-    run = st.button("분석하기")
 
 
 tab1, tab2, tab3, tab4 = st.tabs(["주식 분석", "재무 / 배당", "금일 환율", "용어 설명"])
@@ -479,8 +664,15 @@ def render_stock_area(keyword, market, candle, period, alert_enabled, alert_targ
     change = latest["Close"] - prev["Close"]
     change_rate = change / prev["Close"] * 100
 
-    score, grade, score_reasons = get_score(analyzed)
+    news = load_news(name)
+    news_score = get_news_score(news)
+
+    info = load_financial(yf_symbol)
+    financial_score, financial_reasons = get_financial_score(info)
+
+    score, grade, score_reasons = get_score(analyzed, financial_score=financial_score, news_score=news_score)
     entry, entry_ma20, entry_ma60, target1, target2, take_profit, stop_loss, entry_reasons, level_grounds = get_entry_and_levels(analyzed)
+    volume_info = analyze_volume(analyzed)
 
     with tab1:
         col1, col2, col3 = st.columns([1.1, 2.2, 1.3])
@@ -527,6 +719,19 @@ def render_stock_area(keyword, market, candle, period, alert_enabled, alert_targ
             st.write(f"판단: **{grade}**")
             for r in score_reasons:
                 st.write(f"- {r}")
+
+            st.divider()
+
+            st.write("### 거래량 분석")
+            st.write(f"총 거래량: {volume_info['total_volume']:,.0f}")
+            st.write(f"20개 봉 평균 거래량: {volume_info['avg_volume']:,.0f}")
+            st.write(f"평균 대비 증가율: {volume_info['volume_rate']:.2f}%")
+            st.write(f"매수 우세 추정: {volume_info['buy_est']:,.0f}")
+            st.write(f"매도 우세 추정: {volume_info['sell_est']:,.0f}")
+            st.write(f"판단: **{volume_info['volume_signal']}**")
+            st.write(f"OBV: {volume_info['obv']:,.0f}")
+            st.write(f"- {volume_info['obv_signal']}")
+            st.caption("매수/매도 거래량은 실제 체결 데이터가 아니라 가격 방향 기준 추정입니다.")
 
             st.divider()
 
@@ -583,25 +788,58 @@ def render_stock_area(keyword, market, candle, period, alert_enabled, alert_targ
             macd_fig.update_layout(height=250, xaxis_title="날짜", yaxis_title="MACD")
             st.plotly_chart(macd_fig, use_container_width=True)
 
+            st.subheader("OBV")
+            obv_fig = go.Figure()
+            obv_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["OBV"], name="OBV"))
+            obv_fig.update_layout(height=250, xaxis_title="날짜", yaxis_title="OBV")
+            st.plotly_chart(obv_fig, use_container_width=True)
+
         with col3:
             st.subheader("관련 뉴스")
-            news = load_news(name)
             st.caption("뉴스 캐시 10분 / 뉴스 시간은 KST 기준")
 
             if news:
+                news_pos = 0
+                news_neg = 0
+                news_neu = 0
+
                 for item in news:
-                    with st.expander(item["title"]):
+                    sentiment, color, sentiment_score = get_news_sentiment(item["title"])
+
+                    if sentiment == "긍정":
+                        news_pos += 1
+                    elif sentiment == "부정":
+                        news_neg += 1
+                    else:
+                        news_neu += 1
+
+                    st.markdown(
+                        f"<span style='color:{color}; font-weight:bold;'>[{sentiment}]</span> {item['title']}",
+                        unsafe_allow_html=True
+                    )
+
+                    with st.expander("뉴스 정리 보기"):
                         st.caption(f"뉴스 시간(KST): {item['published']}")
                         for line in summarize_news(item["title"]):
                             st.write(f"- {line}")
                         st.link_button("원문 보기", item["link"])
+
+                st.divider()
+                st.write("### 뉴스 분위기")
+                st.write(f"긍정: {news_pos}개 / 부정: {news_neg}개 / 중립: {news_neu}개")
+                if news_score > 0:
+                    st.success("뉴스 분위기: 긍정 우세")
+                elif news_score < 0:
+                    st.error("뉴스 분위기: 부정 우세")
+                else:
+                    st.info("뉴스 분위기: 중립")
             else:
                 st.write("관련 뉴스를 찾지 못했습니다.")
 
-    return yf_symbol, name, code
+    return yf_symbol, name, code, financial_score, financial_reasons
 
 
-yf_symbol, selected_name, selected_code = render_stock_area(
+yf_symbol, selected_name, selected_code, financial_score, financial_reasons = render_stock_area(
     keyword,
     market,
     candle,
@@ -619,6 +857,11 @@ with tab2:
 
     if yf_symbol:
         info = load_financial(yf_symbol)
+
+        st.write("### 재무 점수")
+        st.write(f"점수: **{financial_score}점**")
+        for reason in financial_reasons:
+            st.write(f"- {reason}")
 
         f1, f2, f3 = st.columns(3)
         f1.metric("PER", info.get("trailingPE", "정보 없음"))
@@ -719,17 +962,23 @@ with tab4:
 ### 거래량
 거래량이 평균보다 증가하면 시장 관심이 커졌다는 의미로 볼 수 있습니다.
 
+### OBV
+가격 상승일의 거래량은 더하고, 하락일의 거래량은 빼서 수급 흐름을 보는 지표입니다.
+
 ### MACD
 추세 전환을 보는 지표입니다. MACD가 Signal 위면 상승 흐름 가능성이 있습니다.
 
 ### AI 점수
-이동평균선, RSI, MACD, 거래량 조건을 점수화한 참고용 지표입니다.
+이동평균선, RSI, MACD, 거래량, OBV, 재무점수, 뉴스 분위기를 점수화한 참고용 지표입니다.
 
 ### 목표가 / 익절가 / 손절가
 ATR과 볼린저밴드를 활용한 참고값입니다.
 
 ### 알림
 목표가, 익절가, 손절가를 입력하면 30초마다 현재가와 비교해 도달 여부를 표시합니다.
+
+### 뉴스 긍정/부정
+뉴스 제목의 키워드를 기준으로 긍정, 부정, 중립을 추정합니다.
 
 ### 배당률
 현재 주가 대비 배당금 비율입니다.
