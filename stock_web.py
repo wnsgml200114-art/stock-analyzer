@@ -1,4 +1,7 @@
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,29 +10,22 @@ import yfinance as yf
 import feedparser
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="AI 주식 분석", layout="wide")
-st.title("AI 주식 분석기_JUNHEE")
+
+st.set_page_config(page_title="AI 주식 분석기", layout="wide")
+st.title("AI 주식 분석기 웹버전")
+
+KST = ZoneInfo("Asia/Seoul")
 
 
-# =========================
-# 자동 새로고침
-# =========================
-
-with st.sidebar:
-    auto_refresh = st.checkbox("3분마다 자동 새로고침", value=True)
-
-if auto_refresh:
-    st.markdown(
-        """
-        <meta http-equiv="refresh" content="180">
-        """,
-        unsafe_allow_html=True
-    )
+def now_kst():
+    return datetime.now(KST)
 
 
-# =========================
-# 포맷
-# =========================
+def format_kst(dt=None):
+    if dt is None:
+        dt = now_kst()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 
 def format_price(value, market):
     try:
@@ -37,6 +33,15 @@ def format_price(value, market):
         if market == "국내":
             return f"{value:,.0f}원"
         return f"${value:,.2f}"
+    except Exception:
+        return "정보 없음"
+
+
+def format_number(value):
+    try:
+        if value is None or pd.isna(value):
+            return "정보 없음"
+        return f"{float(value):,.2f}"
     except Exception:
         return "정보 없음"
 
@@ -61,12 +66,11 @@ def format_korean_money(value):
 
         if jo > 0 and eok > 0:
             return f"{jo}조 {eok:,}억"
-        elif jo > 0:
+        if jo > 0:
             return f"{jo}조"
-        elif eok > 0:
+        if eok > 0:
             return f"{eok:,}억"
-        else:
-            return f"{value:,}"
+        return f"{value:,}"
     except Exception:
         return "정보 없음"
 
@@ -79,9 +83,9 @@ def format_usd_money(value):
         value = float(value)
         if value >= 1_000_000_000_000:
             return f"${value / 1_000_000_000_000:.2f}T"
-        elif value >= 1_000_000_000:
+        if value >= 1_000_000_000:
             return f"${value / 1_000_000_000:.2f}B"
-        elif value >= 1_000_000:
+        if value >= 1_000_000:
             return f"${value / 1_000_000:.2f}M"
         return f"${value:,.0f}"
     except Exception:
@@ -93,10 +97,6 @@ def format_market_cap(value, market):
         return format_korean_money(value)
     return format_usd_money(value)
 
-
-# =========================
-# 종목 검색 / 데이터
-# =========================
 
 @st.cache_data(ttl=3600)
 def get_krx_listing():
@@ -123,7 +123,7 @@ def find_korean_stock_code(keyword):
     return None, None, None
 
 
-@st.cache_data(ttl=180)
+@st.cache_data(ttl=30)
 def load_stock_data(keyword, market):
     if market == "국내":
         code, name, krx_market = find_korean_stock_code(keyword)
@@ -133,7 +133,6 @@ def load_stock_data(keyword, market):
 
         df = fdr.DataReader(code, "2000-01-01")
         yf_symbol = code + ".KQ" if krx_market == "KOSDAQ" else code + ".KS"
-
         return df.dropna(), code, name, yf_symbol
 
     code = keyword.upper()
@@ -188,10 +187,6 @@ def filter_range(df, candle, period):
     return df
 
 
-# =========================
-# 지표
-# =========================
-
 def add_indicators(df):
     df = df.copy()
 
@@ -232,10 +227,6 @@ def add_indicators(df):
 
     return df.dropna()
 
-
-# =========================
-# 분석
-# =========================
 
 def get_score(df):
     latest = df.iloc[-1]
@@ -352,16 +343,50 @@ def get_entry_and_levels(df):
     return entry, ma20, ma60, target1, target2, take_profit, stop_loss, reasons, grounds
 
 
-# =========================
-# 뉴스
-# =========================
+def check_alerts(current_price, market, target_price, take_profit_price, stop_loss_price):
+    results = []
 
-@st.cache_data(ttl=180)
+    if target_price > 0:
+        if current_price >= target_price:
+            results.append(("🚨 목표가 도달", f"현재가 {format_price(current_price, market)} / 목표가 {format_price(target_price, market)}"))
+        else:
+            results.append(("🟢 목표가 대기중", f"현재가 {format_price(current_price, market)} / 목표가 {format_price(target_price, market)}"))
+
+    if take_profit_price > 0:
+        if current_price >= take_profit_price:
+            results.append(("🚨 익절가 도달", f"현재가 {format_price(current_price, market)} / 익절가 {format_price(take_profit_price, market)}"))
+        else:
+            results.append(("🟢 익절가 대기중", f"현재가 {format_price(current_price, market)} / 익절가 {format_price(take_profit_price, market)}"))
+
+    if stop_loss_price > 0:
+        if current_price <= stop_loss_price:
+            results.append(("🚨 손절가 도달", f"현재가 {format_price(current_price, market)} / 손절가 {format_price(stop_loss_price, market)}"))
+        else:
+            results.append(("🟢 손절가 대기중", f"현재가 {format_price(current_price, market)} / 손절가 {format_price(stop_loss_price, market)}"))
+
+    return results
+
+
+@st.cache_data(ttl=600)
 def load_news(name):
     query = name.replace(" ", "+")
     url = f"https://news.google.com/rss/search?q={query}+주식+증권&hl=ko&gl=KR&ceid=KR:ko"
     feed = feedparser.parse(url)
-    return feed.entries[:10]
+    news_items = []
+
+    for entry in feed.entries[:10]:
+        published = "시간 정보 없음"
+        if hasattr(entry, "published_parsed") and entry.published_parsed:
+            published_dt = datetime.fromtimestamp(time.mktime(entry.published_parsed), KST)
+            published = published_dt.strftime("%Y-%m-%d %H:%M")
+
+        news_items.append({
+            "title": entry.title,
+            "link": entry.link,
+            "published": published
+        })
+
+    return news_items
 
 
 def summarize_news(title):
@@ -378,11 +403,7 @@ def summarize_news(title):
     return ["종목 또는 시장 분위기 관련 뉴스입니다.", "제목만으로는 정확한 판단이 어려워 원문 확인이 필요합니다."]
 
 
-# =========================
-# 재무 / 배당
-# =========================
-
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)
 def load_financial(yf_symbol):
     try:
         ticker = yf.Ticker(yf_symbol)
@@ -391,11 +412,7 @@ def load_financial(yf_symbol):
         return {}
 
 
-# =========================
-# 환율
-# =========================
-
-@st.cache_data(ttl=180)
+@st.cache_data(ttl=300)
 def load_exchange_data(symbol):
     daily = yf.download(symbol, period="1mo", interval="1d", progress=False, auto_adjust=False)
     hourly = yf.download(symbol, period="5d", interval="1h", progress=False, auto_adjust=False)
@@ -408,10 +425,6 @@ def load_exchange_data(symbol):
 
     return daily.dropna(), hourly.dropna()
 
-
-# =========================
-# 사이드바
-# =========================
 
 with st.sidebar:
     st.header("검색 설정")
@@ -430,8 +443,12 @@ with st.sidebar:
     else:
         period = st.selectbox("표시 기간", ["1년", "3년", "5년", "10년", "20년", "전체"])
 
-    alert_price = st.number_input("알림가", min_value=0.0, value=0.0)
-    alert_direction = st.selectbox("알림 조건", ["이상 도달", "이하 도달"])
+    st.divider()
+    st.subheader("가격 알림")
+    alert_enabled = st.checkbox("알림 사용", value=False)
+    alert_target_price = st.number_input("목표가", min_value=0.0, value=0.0, step=100.0)
+    alert_take_profit_price = st.number_input("익절가", min_value=0.0, value=0.0, step=100.0)
+    alert_stop_loss_price = st.number_input("손절가", min_value=0.0, value=0.0, step=100.0)
 
     run = st.button("분석하기")
 
@@ -439,152 +456,188 @@ with st.sidebar:
 tab1, tab2, tab3, tab4 = st.tabs(["주식 분석", "재무 / 배당", "금일 환율", "용어 설명"])
 
 
-# =========================
-# 주식 분석
-# =========================
-
-if run or True:
+@st.fragment(run_every="30s")
+def render_stock_area(keyword, market, candle, period, alert_enabled, alert_target_price, alert_take_profit_price, alert_stop_loss_price):
     df, code, name, yf_symbol = load_stock_data(keyword, market)
 
-    if df is not None and not df.empty:
-        candle_df = convert_candle(df, candle)
-        analyzed = add_indicators(candle_df)
+    if df is None or df.empty:
+        st.error("종목 데이터를 불러오지 못했습니다.")
+        return None, None, None
 
-        if len(analyzed) >= 30:
-            display_df = filter_range(analyzed, candle, period)
+    candle_df = convert_candle(df, candle)
+    analyzed = add_indicators(candle_df)
 
-            latest = analyzed.iloc[-1]
-            prev = analyzed.iloc[-2]
+    if len(analyzed) < 30:
+        st.error("분석할 데이터가 부족합니다.")
+        return None, None, None
 
-            change = latest["Close"] - prev["Close"]
-            change_rate = change / prev["Close"] * 100
+    display_df = filter_range(analyzed, candle, period)
 
-            score, grade, score_reasons = get_score(analyzed)
-            entry, entry_ma20, entry_ma60, target1, target2, take_profit, stop_loss, entry_reasons, level_grounds = get_entry_and_levels(analyzed)
+    latest = analyzed.iloc[-1]
+    prev = analyzed.iloc[-2]
 
-            with tab1:
-                col1, col2, col3 = st.columns([1.1, 2.2, 1.3])
+    change = latest["Close"] - prev["Close"]
+    change_rate = change / prev["Close"] * 100
 
-                with col1:
-                    st.subheader("분석 결과")
+    score, grade, score_reasons = get_score(analyzed)
+    entry, entry_ma20, entry_ma60, target1, target2, take_profit, stop_loss, entry_reasons, level_grounds = get_entry_and_levels(analyzed)
 
-                    st.metric(
-                        label=f"{name} 현재가",
-                        value=format_price(latest["Close"], market),
-                        delta=f"{change:,.2f} / {change_rate:.2f}%"
-                    )
+    with tab1:
+        col1, col2, col3 = st.columns([1.1, 2.2, 1.3])
 
-                    st.write(f"시장: {market}")
-                    st.write(f"코드/티커: {code}")
-                    st.write(f"봉 종류: {candle}")
-                    st.write(f"표시 기간: {period}")
+        with col1:
+            st.subheader("분석 결과")
+            st.caption(f"주가 업데이트(KST): {format_kst()} / 주가 데이터 캐시 30초")
 
-                    st.divider()
+            st.metric(
+                label=f"{name} 현재가",
+                value=format_price(latest["Close"], market),
+                delta=f"{change:,.2f} / {change_rate:.2f}%"
+            )
 
-                    st.write("### AI 종합 점수")
-                    st.write(f"점수: **{score}점**")
-                    st.write(f"판단: **{grade}**")
-                    for r in score_reasons:
-                        st.write(f"- {r}")
+            st.write(f"시장: {market}")
+            st.write(f"코드/티커: {code}")
+            st.write(f"봉 종류: {candle}")
+            st.write(f"표시 기간: {period}")
 
-                    st.divider()
+            if alert_enabled:
+                st.divider()
+                st.write("### 알림 상태")
+                alerts = check_alerts(
+                    latest["Close"],
+                    market,
+                    alert_target_price,
+                    alert_take_profit_price,
+                    alert_stop_loss_price
+                )
 
-                    st.write("### 진입 타이밍")
-                    st.write(f"판단: **{entry}**")
-                    st.write(f"기준 진입가: {format_price(entry_ma20, market)}")
-                    st.write(f"보수적 진입가: {format_price(entry_ma60, market)}")
-                    for r in entry_reasons:
-                        st.write(f"- {r}")
-
-                    st.divider()
-
-                    st.write("### 목표가 / 익절가 / 손절가")
-                    st.write(f"1차 목표가: {format_price(target1, market)}")
-                    st.write(f"2차 목표가: {format_price(target2, market)}")
-                    st.write(f"익절가 참고: {format_price(take_profit, market)}")
-                    st.write(f"손절가 참고: {format_price(stop_loss, market)}")
-                    for g in level_grounds:
-                        st.write(f"- {g}")
-
-                    if alert_price > 0:
-                        current = latest["Close"]
-                        if alert_direction == "이상 도달" and current >= alert_price:
-                            st.warning(f"가격 알림 도달: 현재가 {format_price(current, market)}")
-                        elif alert_direction == "이하 도달" and current <= alert_price:
-                            st.warning(f"가격 알림 도달: 현재가 {format_price(current, market)}")
+                if alerts:
+                    for title, desc in alerts:
+                        if "🚨" in title:
+                            st.warning(f"{title}\n\n{desc}\n\n알림 시간(KST): {format_kst()}")
                         else:
-                            st.info(f"알림 대기 중: 현재가 {format_price(current, market)}")
+                            st.info(f"{title}\n\n{desc}\n\n확인 시간(KST): {format_kst()}")
+                else:
+                    st.info("알림 사용은 켜져 있지만 목표가/익절가/손절가가 입력되지 않았습니다.")
 
-                with col2:
-                    st.subheader("차트")
+            st.divider()
 
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["Close"], name="Close"))
-                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA5"], name="MA5"))
-                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA20"], name="MA20"))
-                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA60"], name="MA60"))
-                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["BB_UPPER"], name="BB Upper"))
-                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["BB_LOWER"], name="BB Lower"))
+            st.write("### AI 종합 점수")
+            st.write(f"점수: **{score}점**")
+            st.write(f"판단: **{grade}**")
+            for r in score_reasons:
+                st.write(f"- {r}")
 
-                    fig.update_layout(height=500, xaxis_title="날짜", yaxis_title="가격", hovermode="x unified")
-                    st.plotly_chart(fig, use_container_width=True)
+            st.divider()
 
-                    st.subheader("거래량")
-                    volume_fig = go.Figure()
-                    volume_fig.add_trace(go.Bar(x=display_df.index, y=display_df["Volume"], name="Volume"))
-                    volume_fig.update_layout(height=250, xaxis_title="날짜", yaxis_title="거래량")
-                    st.plotly_chart(volume_fig, use_container_width=True)
+            st.write("### 진입 타이밍")
+            st.write(f"판단: **{entry}**")
+            st.write(f"기준 진입가: {format_price(entry_ma20, market)}")
+            st.write(f"보수적 진입가: {format_price(entry_ma60, market)}")
+            for r in entry_reasons:
+                st.write(f"- {r}")
 
-                    st.subheader("RSI")
-                    rsi_fig = go.Figure()
-                    rsi_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["RSI"], name="RSI"))
-                    rsi_fig.add_hline(y=70, line_dash="dash", annotation_text="과열")
-                    rsi_fig.add_hline(y=30, line_dash="dash", annotation_text="과매도")
-                    rsi_fig.update_layout(height=250, yaxis=dict(range=[0, 100]), xaxis_title="날짜", yaxis_title="RSI")
-                    st.plotly_chart(rsi_fig, use_container_width=True)
+            st.divider()
 
-                    st.subheader("MACD")
-                    macd_fig = go.Figure()
-                    macd_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MACD"], name="MACD"))
-                    macd_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MACD_SIGNAL"], name="Signal"))
-                    macd_fig.add_trace(go.Bar(x=display_df.index, y=display_df["MACD_HIST"], name="Histogram"))
-                    macd_fig.update_layout(height=250, xaxis_title="날짜", yaxis_title="MACD")
-                    st.plotly_chart(macd_fig, use_container_width=True)
+            st.write("### 목표가 / 익절가 / 손절가")
+            st.write(f"1차 목표가: {format_price(target1, market)}")
+            st.write(f"2차 목표가: {format_price(target2, market)}")
+            st.write(f"익절가 참고: {format_price(take_profit, market)}")
+            st.write(f"손절가 참고: {format_price(stop_loss, market)}")
+            for g in level_grounds:
+                st.write(f"- {g}")
 
-                with col3:
-                    st.subheader("관련 뉴스")
-                    news = load_news(name)
+        with col2:
+            st.subheader("차트")
 
-                    if news:
-                        for item in news:
-                            with st.expander(item.title):
-                                for line in summarize_news(item.title):
-                                    st.write(f"- {line}")
-                                st.link_button("원문 보기", item.link)
-                    else:
-                        st.write("관련 뉴스를 찾지 못했습니다.")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df["Close"], name="Close"))
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA5"], name="MA5"))
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA20"], name="MA20"))
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA60"], name="MA60"))
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df["BB_UPPER"], name="BB Upper"))
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df["BB_LOWER"], name="BB Lower"))
 
-            with tab2:
-                st.subheader("재무 / 배당")
-                info = load_financial(yf_symbol)
+            fig.update_layout(height=500, xaxis_title="날짜", yaxis_title="가격", hovermode="x unified")
+            st.plotly_chart(fig, use_container_width=True)
 
-                f1, f2, f3 = st.columns(3)
-                f1.metric("PER", info.get("trailingPE", "정보 없음"))
-                f2.metric("PBR", info.get("priceToBook", "정보 없음"))
-                f3.metric("ROE", format_percent(info.get("returnOnEquity")))
+            st.subheader("거래량")
+            volume_fig = go.Figure()
+            volume_fig.add_trace(go.Bar(x=display_df.index, y=display_df["Volume"], name="Volume"))
+            volume_fig.update_layout(height=250, xaxis_title="날짜", yaxis_title="거래량")
+            st.plotly_chart(volume_fig, use_container_width=True)
 
-                f4, f5, f6 = st.columns(3)
-                f4.metric("배당률", format_percent(info.get("dividendYield")))
-                f5.metric("배당금", info.get("dividendRate", "정보 없음"))
-                f6.metric("시가총액", format_market_cap(info.get("marketCap"), market))
+            st.subheader("RSI")
+            rsi_fig = go.Figure()
+            rsi_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["RSI"], name="RSI"))
+            rsi_fig.add_hline(y=70, line_dash="dash", annotation_text="과열")
+            rsi_fig.add_hline(y=30, line_dash="dash", annotation_text="과매도")
+            rsi_fig.update_layout(height=250, yaxis=dict(range=[0, 100]), xaxis_title="날짜", yaxis_title="RSI")
+            st.plotly_chart(rsi_fig, use_container_width=True)
+
+            st.subheader("MACD")
+            macd_fig = go.Figure()
+            macd_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MACD"], name="MACD"))
+            macd_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MACD_SIGNAL"], name="Signal"))
+            macd_fig.add_trace(go.Bar(x=display_df.index, y=display_df["MACD_HIST"], name="Histogram"))
+            macd_fig.update_layout(height=250, xaxis_title="날짜", yaxis_title="MACD")
+            st.plotly_chart(macd_fig, use_container_width=True)
+
+        with col3:
+            st.subheader("관련 뉴스")
+            news = load_news(name)
+            st.caption("뉴스 캐시 10분 / 뉴스 시간은 KST 기준")
+
+            if news:
+                for item in news:
+                    with st.expander(item["title"]):
+                        st.caption(f"뉴스 시간(KST): {item['published']}")
+                        for line in summarize_news(item["title"]):
+                            st.write(f"- {line}")
+                        st.link_button("원문 보기", item["link"])
+            else:
+                st.write("관련 뉴스를 찾지 못했습니다.")
+
+    return yf_symbol, name, code
 
 
-# =========================
-# 환율
-# =========================
+yf_symbol, selected_name, selected_code = render_stock_area(
+    keyword,
+    market,
+    candle,
+    period,
+    alert_enabled,
+    alert_target_price,
+    alert_take_profit_price,
+    alert_stop_loss_price
+)
+
+
+with tab2:
+    st.subheader("재무 / 배당")
+    st.caption("재무/배당 데이터는 1일 캐시입니다.")
+
+    if yf_symbol:
+        info = load_financial(yf_symbol)
+
+        f1, f2, f3 = st.columns(3)
+        f1.metric("PER", info.get("trailingPE", "정보 없음"))
+        f2.metric("PBR", info.get("priceToBook", "정보 없음"))
+        f3.metric("ROE", format_percent(info.get("returnOnEquity")))
+
+        f4, f5, f6 = st.columns(3)
+        f4.metric("배당률", format_percent(info.get("dividendYield")))
+        f5.metric("배당금", info.get("dividendRate", "정보 없음"))
+        f6.metric("시가총액", format_market_cap(info.get("marketCap"), market))
+
+        st.caption(f"재무/배당 조회 시간(KST): {format_kst()}")
+    else:
+        st.info("종목을 먼저 조회하면 재무/배당 정보가 표시됩니다.")
+
 
 with tab3:
     st.subheader("금일 환율 / 최근 1개월 일별 환율")
+    st.caption("환율 데이터는 5분 캐시입니다. Yahoo Finance 무료 데이터 기준이라 은행 고시환율과 차이가 있을 수 있습니다.")
 
     exchange_options = {
         "미국 달러 / 원": "KRW=X",
@@ -601,7 +654,6 @@ with tab3:
     if not daily_df.empty:
         latest_source = hourly_df if not hourly_df.empty else daily_df
         latest = latest_source.iloc[-1]
-
         prev = daily_df.iloc[-2] if len(daily_df) >= 2 else daily_df.iloc[-1]
 
         latest_close = float(latest["Close"])
@@ -625,7 +677,7 @@ with tab3:
             delta=f"{display_change:,.2f}원 / {change_rate:.2f}%"
         )
 
-        st.caption("환율은 Yahoo Finance 무료 데이터 기준이며, 실제 은행 고시환율과 차이가 있을 수 있습니다.")
+        st.caption(f"환율 업데이트(KST): {format_kst()}")
 
         fig_ex = go.Figure()
         y_values = daily_df["Close"] * 100 if selected_exchange == "일본 엔 / 원" else daily_df["Close"]
@@ -657,10 +709,6 @@ with tab3:
         st.warning("환율 데이터를 불러오지 못했습니다.")
 
 
-# =========================
-# 용어 설명
-# =========================
-
 with tab4:
     st.subheader("용어 설명")
 
@@ -680,6 +728,9 @@ with tab4:
 ### 목표가 / 익절가 / 손절가
 ATR과 볼린저밴드를 활용한 참고값입니다.
 
+### 알림
+목표가, 익절가, 손절가를 입력하면 30초마다 현재가와 비교해 도달 여부를 표시합니다.
+
 ### 배당률
 현재 주가 대비 배당금 비율입니다.
 
@@ -687,4 +738,4 @@ ATR과 볼린저밴드를 활용한 참고값입니다.
 무료 데이터 기준이라 실제 은행 고시환율과 약간 차이가 있을 수 있습니다.
 """)
 
-st.caption(f"마지막 새로고침: {time.strftime('%Y-%m-%d %H:%M:%S')} / 3분마다 자동 갱신")
+st.caption(f"마지막 화면 렌더링(KST): {format_kst()} / 주가 30초, 환율 5분, 뉴스 10분, 재무·배당 1일 캐시")
