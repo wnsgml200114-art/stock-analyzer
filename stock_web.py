@@ -7,8 +7,8 @@ import yfinance as yf
 import feedparser
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="AI 주식 분석기", layout="wide")
-st.title("AI 주식 분석기 웹버전")
+st.set_page_config(page_title="AI 주식 분석", layout="wide")
+st.title("AI 주식 분석기_JUNHEE")
 
 
 # =========================
