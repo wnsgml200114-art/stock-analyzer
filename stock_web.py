@@ -1,17 +1,111 @@
+import time
 import streamlit as st
 import pandas as pd
+import numpy as np
 import FinanceDataReader as fdr
 import yfinance as yf
 import feedparser
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="AI 주식 분석기", layout="wide")
-st.title("AI 주식 분석_junhee")
+st.title("AI 주식 분석기 웹버전")
+
+
+# =========================
+# 자동 새로고침
+# =========================
+
+with st.sidebar:
+    auto_refresh = st.checkbox("3분마다 자동 새로고침", value=True)
+
+if auto_refresh:
+    st.markdown(
+        """
+        <meta http-equiv="refresh" content="180">
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# =========================
+# 포맷
+# =========================
+
+def format_price(value, market):
+    try:
+        value = float(value)
+        if market == "국내":
+            return f"{value:,.0f}원"
+        return f"${value:,.2f}"
+    except Exception:
+        return "정보 없음"
+
+
+def format_percent(value):
+    try:
+        if value is None or pd.isna(value):
+            return "정보 없음"
+        return f"{float(value) * 100:.2f}%"
+    except Exception:
+        return "정보 없음"
+
+
+def format_korean_money(value):
+    try:
+        if value is None or pd.isna(value):
+            return "정보 없음"
+
+        value = int(value)
+        jo = value // 1_0000_0000_0000
+        eok = (value % 1_0000_0000_0000) // 1_0000_0000
+
+        if jo > 0 and eok > 0:
+            return f"{jo}조 {eok:,}억"
+        elif jo > 0:
+            return f"{jo}조"
+        elif eok > 0:
+            return f"{eok:,}억"
+        else:
+            return f"{value:,}"
+    except Exception:
+        return "정보 없음"
+
+
+def format_usd_money(value):
+    try:
+        if value is None or pd.isna(value):
+            return "정보 없음"
+
+        value = float(value)
+        if value >= 1_000_000_000_000:
+            return f"${value / 1_000_000_000_000:.2f}T"
+        elif value >= 1_000_000_000:
+            return f"${value / 1_000_000_000:.2f}B"
+        elif value >= 1_000_000:
+            return f"${value / 1_000_000:.2f}M"
+        return f"${value:,.0f}"
+    except Exception:
+        return "정보 없음"
+
+
+def format_market_cap(value, market):
+    if market == "국내":
+        return format_korean_money(value)
+    return format_usd_money(value)
+
+
+# =========================
+# 종목 검색 / 데이터
+# =========================
+
+@st.cache_data(ttl=3600)
+def get_krx_listing():
+    stock_list = fdr.StockListing("KRX")
+    return stock_list[["Code", "Name", "Market"]]
 
 
 def find_korean_stock_code(keyword):
-    stock_list = fdr.StockListing("KRX")
-    stock_list = stock_list[["Code", "Name", "Market"]]
+    stock_list = get_krx_listing()
 
     exact = stock_list[stock_list["Name"] == keyword]
     if not exact.empty:
@@ -29,15 +123,17 @@ def find_korean_stock_code(keyword):
     return None, None, None
 
 
+@st.cache_data(ttl=180)
 def load_stock_data(keyword, market):
     if market == "국내":
         code, name, krx_market = find_korean_stock_code(keyword)
+
         if code is None:
-            st.error("국내 종목을 찾지 못했습니다.")
             return None, None, None, None
 
         df = fdr.DataReader(code, "2000-01-01")
         yf_symbol = code + ".KQ" if krx_market == "KOSDAQ" else code + ".KS"
+
         return df.dropna(), code, name, yf_symbol
 
     code = keyword.upper()
@@ -53,7 +149,11 @@ def convert_candle(df, candle):
     if candle == "일봉":
         return df
 
-    rule = {"주봉": "W", "월봉": "ME", "년봉": "YE"}[candle]
+    rule = {
+        "주봉": "W",
+        "월봉": "ME",
+        "년봉": "YE"
+    }[candle]
 
     return df.resample(rule).agg({
         "Open": "first",
@@ -88,6 +188,10 @@ def filter_range(df, candle, period):
     return df
 
 
+# =========================
+# 지표
+# =========================
+
 def add_indicators(df):
     df = df.copy()
 
@@ -115,6 +219,7 @@ def add_indicators(df):
 
     df["MACD"] = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
 
     prev_close = df["Close"].shift(1)
     tr = pd.concat([
@@ -128,11 +233,9 @@ def add_indicators(df):
     return df.dropna()
 
 
-def format_price(value, market):
-    if market == "국내":
-        return f"{value:,.0f}원"
-    return f"${value:,.2f}"
-
+# =========================
+# 분석
+# =========================
 
 def get_score(df):
     latest = df.iloc[-1]
@@ -153,12 +256,19 @@ def get_score(df):
         score -= 8
         reasons.append("20선이 60선 아래에 있어 중기 흐름이 약합니다.")
 
+    if latest["Close"] > latest["MA60"]:
+        score += 8
+        reasons.append("현재가가 60선 위에 있어 장기 흐름이 양호합니다.")
+    else:
+        score -= 8
+        reasons.append("현재가가 60선 아래에 있어 장기 흐름이 약합니다.")
+
     if 30 <= latest["RSI"] <= 45:
         score += 12
         reasons.append("RSI가 저점 반등 관심 구간입니다.")
     elif latest["RSI"] < 30:
         score += 5
-        reasons.append("RSI가 과매도 구간입니다.")
+        reasons.append("RSI가 과매도 구간입니다. 반등 가능성은 있지만 추가 하락도 주의해야 합니다.")
     elif latest["RSI"] >= 70:
         score -= 15
         reasons.append("RSI가 과열 구간입니다.")
@@ -171,6 +281,16 @@ def get_score(df):
     else:
         score -= 8
         reasons.append("MACD가 Signal 아래에 있어 모멘텀이 약합니다.")
+
+    avg_volume20 = df["Volume"].rolling(20).mean().iloc[-1]
+    if latest["Volume"] > avg_volume20 * 1.5:
+        score += 10
+        reasons.append("거래량이 20개 봉 평균보다 크게 증가했습니다.")
+    elif latest["Volume"] > avg_volume20:
+        score += 5
+        reasons.append("거래량이 평균보다 증가했습니다.")
+    else:
+        reasons.append("거래량 증가가 약합니다.")
 
     score = max(0, min(100, score))
 
@@ -195,24 +315,48 @@ def get_entry_and_levels(df):
     ma20 = latest["MA20"]
     ma60 = latest["MA60"]
     atr = latest["ATR"]
+    bb_upper = latest["BB_UPPER"]
+    bb_lower = latest["BB_LOWER"]
 
     target1 = close + atr * 1.5
     target2 = close + atr * 2.5
-    take_profit = close + atr * 2.0
-    stop_loss = close - atr * 1.2
+    take_profit = min(bb_upper, close + atr * 2.0)
+    stop_loss = max(bb_lower, close - atr * 1.2)
+
+    reasons = []
 
     if close > ma20 and latest["MA5"] > ma20 and latest["MACD"] > latest["MACD_SIGNAL"]:
         entry = "분할매수 검토 가능"
+        reasons.append("현재가가 20선 위에 있고 5선도 20선 위에 있습니다.")
+        reasons.append("MACD가 Signal 위에 있어 상승 흐름 가능성이 있습니다.")
     elif close < ma20 and 30 <= latest["RSI"] <= 45:
         entry = "반등 확인 후 진입"
+        reasons.append("RSI는 저점 반등 관심 구간입니다.")
+        reasons.append("현재가가 20선 아래라 20선 회복 확인이 필요합니다.")
     elif latest["RSI"] < 30:
         entry = "과매도 구간, 신중한 분할 접근"
+        reasons.append("RSI가 30 이하로 과매도 구간입니다.")
+        reasons.append("반등 가능성은 있지만 추가 하락도 주의해야 합니다.")
     else:
         entry = "관망"
+        reasons.append("이동평균선, RSI, MACD 조건이 아직 강하지 않습니다.")
 
-    return entry, ma20, ma60, target1, target2, take_profit, stop_loss
+    grounds = [
+        f"ATR 기준 변동폭: {atr:,.2f}",
+        "1차 목표가는 현재가 + ATR × 1.5 기준입니다.",
+        "2차 목표가는 현재가 + ATR × 2.5 기준입니다.",
+        "익절가는 볼린저밴드 상단과 ATR 기준 목표가 중 보수적인 값을 사용했습니다.",
+        "손절가는 볼린저밴드 하단과 ATR 기준 손절가 중 보수적인 값을 사용했습니다."
+    ]
+
+    return entry, ma20, ma60, target1, target2, take_profit, stop_loss, reasons, grounds
 
 
+# =========================
+# 뉴스
+# =========================
+
+@st.cache_data(ttl=180)
 def load_news(name):
     query = name.replace(" ", "+")
     url = f"https://news.google.com/rss/search?q={query}+주식+증권&hl=ko&gl=KR&ceid=KR:ko"
@@ -220,6 +364,25 @@ def load_news(name):
     return feed.entries[:10]
 
 
+def summarize_news(title):
+    if "실적" in title or "영업이익" in title or "매출" in title:
+        return ["실적 관련 뉴스입니다.", "매출과 이익 변화가 주가에 영향을 줄 수 있습니다."]
+    if "배당" in title:
+        return ["배당 관련 뉴스입니다.", "배당 확대는 투자 심리에 긍정적일 수 있습니다."]
+    if "목표가" in title or "투자의견" in title:
+        return ["증권사 리포트 관련 뉴스입니다.", "목표가 조정은 단기 주가에 영향을 줄 수 있습니다."]
+    if "반도체" in title or "AI" in title or "HBM" in title:
+        return ["산업 업황 관련 뉴스입니다.", "관련 섹터 전체에 영향을 줄 수 있습니다."]
+    if "금리" in title or "환율" in title:
+        return ["거시경제 관련 뉴스입니다.", "금리와 환율은 시장 전체에 영향을 줄 수 있습니다."]
+    return ["종목 또는 시장 분위기 관련 뉴스입니다.", "제목만으로는 정확한 판단이 어려워 원문 확인이 필요합니다."]
+
+
+# =========================
+# 재무 / 배당
+# =========================
+
+@st.cache_data(ttl=3600)
 def load_financial(yf_symbol):
     try:
         ticker = yf.Ticker(yf_symbol)
@@ -228,14 +391,27 @@ def load_financial(yf_symbol):
         return {}
 
 
+# =========================
+# 환율
+# =========================
+
+@st.cache_data(ttl=180)
 def load_exchange_data(symbol):
-    df = yf.download(symbol, period="1mo", interval="1d", progress=False, auto_adjust=False)
+    daily = yf.download(symbol, period="1mo", interval="1d", progress=False, auto_adjust=False)
+    hourly = yf.download(symbol, period="5d", interval="1h", progress=False, auto_adjust=False)
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    if isinstance(daily.columns, pd.MultiIndex):
+        daily.columns = daily.columns.get_level_values(0)
 
-    return df.dropna()
+    if isinstance(hourly.columns, pd.MultiIndex):
+        hourly.columns = hourly.columns.get_level_values(0)
 
+    return daily.dropna(), hourly.dropna()
+
+
+# =========================
+# 사이드바
+# =========================
 
 with st.sidebar:
     st.header("검색 설정")
@@ -263,161 +439,149 @@ with st.sidebar:
 tab1, tab2, tab3, tab4 = st.tabs(["주식 분석", "재무 / 배당", "금일 환율", "용어 설명"])
 
 
-if run:
+# =========================
+# 주식 분석
+# =========================
+
+if run or True:
     df, code, name, yf_symbol = load_stock_data(keyword, market)
 
     if df is not None and not df.empty:
         candle_df = convert_candle(df, candle)
         analyzed = add_indicators(candle_df)
 
-        if len(analyzed) < 30:
-            st.error("분석할 데이터가 부족합니다.")
-            st.stop()
+        if len(analyzed) >= 30:
+            display_df = filter_range(analyzed, candle, period)
 
-        display_df = filter_range(analyzed, candle, period)
+            latest = analyzed.iloc[-1]
+            prev = analyzed.iloc[-2]
 
-        latest = analyzed.iloc[-1]
-        prev = analyzed.iloc[-2]
+            change = latest["Close"] - prev["Close"]
+            change_rate = change / prev["Close"] * 100
 
-        change = latest["Close"] - prev["Close"]
-        change_rate = change / prev["Close"] * 100
+            score, grade, score_reasons = get_score(analyzed)
+            entry, entry_ma20, entry_ma60, target1, target2, take_profit, stop_loss, entry_reasons, level_grounds = get_entry_and_levels(analyzed)
 
-        score, grade, reasons = get_score(analyzed)
-        entry, entry_ma20, entry_ma60, target1, target2, take_profit, stop_loss = get_entry_and_levels(analyzed)
+            with tab1:
+                col1, col2, col3 = st.columns([1.1, 2.2, 1.3])
 
-        with tab1:
-            col1, col2, col3 = st.columns([1.1, 2.2, 1.3])
+                with col1:
+                    st.subheader("분석 결과")
 
-            with col1:
-                st.subheader("분석 결과")
+                    st.metric(
+                        label=f"{name} 현재가",
+                        value=format_price(latest["Close"], market),
+                        delta=f"{change:,.2f} / {change_rate:.2f}%"
+                    )
 
-                st.metric(
-                    label=f"{name} 현재가",
-                    value=format_price(latest["Close"], market),
-                    delta=f"{change:,.2f} / {change_rate:.2f}%"
-                )
+                    st.write(f"시장: {market}")
+                    st.write(f"코드/티커: {code}")
+                    st.write(f"봉 종류: {candle}")
+                    st.write(f"표시 기간: {period}")
 
-                st.write(f"시장: {market}")
-                st.write(f"코드/티커: {code}")
-                st.write(f"봉 종류: {candle}")
-                st.write(f"표시 기간: {period}")
+                    st.divider()
 
-                st.divider()
+                    st.write("### AI 종합 점수")
+                    st.write(f"점수: **{score}점**")
+                    st.write(f"판단: **{grade}**")
+                    for r in score_reasons:
+                        st.write(f"- {r}")
 
-                st.write("### 이동평균선")
-                st.write(f"MA5: {format_price(latest['MA5'], market)}")
-                st.write(f"MA20: {format_price(latest['MA20'], market)}")
-                st.write(f"MA60: {format_price(latest['MA60'], market)}")
+                    st.divider()
 
-                st.write("### 보조지표")
-                st.write(f"RSI: {latest['RSI']:.2f}")
-                st.write(f"MACD: {latest['MACD']:.2f}")
-                st.write(f"Signal: {latest['MACD_SIGNAL']:.2f}")
-                st.write(f"ATR: {latest['ATR']:.2f}")
+                    st.write("### 진입 타이밍")
+                    st.write(f"판단: **{entry}**")
+                    st.write(f"기준 진입가: {format_price(entry_ma20, market)}")
+                    st.write(f"보수적 진입가: {format_price(entry_ma60, market)}")
+                    for r in entry_reasons:
+                        st.write(f"- {r}")
 
-                st.divider()
+                    st.divider()
 
-                st.write("### 진입 타이밍")
-                st.write(f"판단: **{entry}**")
-                st.write(f"기준 진입가: {format_price(entry_ma20, market)}")
-                st.write(f"보수적 진입가: {format_price(entry_ma60, market)}")
+                    st.write("### 목표가 / 익절가 / 손절가")
+                    st.write(f"1차 목표가: {format_price(target1, market)}")
+                    st.write(f"2차 목표가: {format_price(target2, market)}")
+                    st.write(f"익절가 참고: {format_price(take_profit, market)}")
+                    st.write(f"손절가 참고: {format_price(stop_loss, market)}")
+                    for g in level_grounds:
+                        st.write(f"- {g}")
 
-                st.write("### 목표가 / 익절가 / 손절가")
-                st.write(f"1차 목표가: {format_price(target1, market)}")
-                st.write(f"2차 목표가: {format_price(target2, market)}")
-                st.write(f"익절가 참고: {format_price(take_profit, market)}")
-                st.write(f"손절가 참고: {format_price(stop_loss, market)}")
+                    if alert_price > 0:
+                        current = latest["Close"]
+                        if alert_direction == "이상 도달" and current >= alert_price:
+                            st.warning(f"가격 알림 도달: 현재가 {format_price(current, market)}")
+                        elif alert_direction == "이하 도달" and current <= alert_price:
+                            st.warning(f"가격 알림 도달: 현재가 {format_price(current, market)}")
+                        else:
+                            st.info(f"알림 대기 중: 현재가 {format_price(current, market)}")
 
-                st.divider()
+                with col2:
+                    st.subheader("차트")
 
-                st.write("### 종합 점수")
-                st.write(f"점수: **{score}점**")
-                st.write(f"판단: **{grade}**")
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["Close"], name="Close"))
+                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA5"], name="MA5"))
+                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA20"], name="MA20"))
+                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA60"], name="MA60"))
+                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["BB_UPPER"], name="BB Upper"))
+                    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["BB_LOWER"], name="BB Lower"))
 
-                for r in reasons:
-                    st.write(f"- {r}")
+                    fig.update_layout(height=500, xaxis_title="날짜", yaxis_title="가격", hovermode="x unified")
+                    st.plotly_chart(fig, use_container_width=True)
 
-                if alert_price > 0:
-                    current = latest["Close"]
+                    st.subheader("거래량")
+                    volume_fig = go.Figure()
+                    volume_fig.add_trace(go.Bar(x=display_df.index, y=display_df["Volume"], name="Volume"))
+                    volume_fig.update_layout(height=250, xaxis_title="날짜", yaxis_title="거래량")
+                    st.plotly_chart(volume_fig, use_container_width=True)
 
-                    if alert_direction == "이상 도달" and current >= alert_price:
-                        st.warning(f"가격 알림 도달: 현재가 {format_price(current, market)}")
-                    elif alert_direction == "이하 도달" and current <= alert_price:
-                        st.warning(f"가격 알림 도달: 현재가 {format_price(current, market)}")
+                    st.subheader("RSI")
+                    rsi_fig = go.Figure()
+                    rsi_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["RSI"], name="RSI"))
+                    rsi_fig.add_hline(y=70, line_dash="dash", annotation_text="과열")
+                    rsi_fig.add_hline(y=30, line_dash="dash", annotation_text="과매도")
+                    rsi_fig.update_layout(height=250, yaxis=dict(range=[0, 100]), xaxis_title="날짜", yaxis_title="RSI")
+                    st.plotly_chart(rsi_fig, use_container_width=True)
+
+                    st.subheader("MACD")
+                    macd_fig = go.Figure()
+                    macd_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MACD"], name="MACD"))
+                    macd_fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MACD_SIGNAL"], name="Signal"))
+                    macd_fig.add_trace(go.Bar(x=display_df.index, y=display_df["MACD_HIST"], name="Histogram"))
+                    macd_fig.update_layout(height=250, xaxis_title="날짜", yaxis_title="MACD")
+                    st.plotly_chart(macd_fig, use_container_width=True)
+
+                with col3:
+                    st.subheader("관련 뉴스")
+                    news = load_news(name)
+
+                    if news:
+                        for item in news:
+                            with st.expander(item.title):
+                                for line in summarize_news(item.title):
+                                    st.write(f"- {line}")
+                                st.link_button("원문 보기", item.link)
                     else:
-                        st.info(f"알림 대기 중: 현재가 {format_price(current, market)}")
+                        st.write("관련 뉴스를 찾지 못했습니다.")
 
-            with col2:
-                st.subheader("차트")
+            with tab2:
+                st.subheader("재무 / 배당")
+                info = load_financial(yf_symbol)
 
-                fig = go.Figure()
+                f1, f2, f3 = st.columns(3)
+                f1.metric("PER", info.get("trailingPE", "정보 없음"))
+                f2.metric("PBR", info.get("priceToBook", "정보 없음"))
+                f3.metric("ROE", format_percent(info.get("returnOnEquity")))
 
-                fig.add_trace(go.Scatter(x=display_df.index, y=display_df["Close"], name="Close"))
-                fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA5"], name="MA5"))
-                fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA20"], name="MA20"))
-                fig.add_trace(go.Scatter(x=display_df.index, y=display_df["MA60"], name="MA60"))
-                fig.add_trace(go.Scatter(x=display_df.index, y=display_df["BB_UPPER"], name="BB Upper"))
-                fig.add_trace(go.Scatter(x=display_df.index, y=display_df["BB_LOWER"], name="BB Lower"))
+                f4, f5, f6 = st.columns(3)
+                f4.metric("배당률", format_percent(info.get("dividendYield")))
+                f5.metric("배당금", info.get("dividendRate", "정보 없음"))
+                f6.metric("시가총액", format_market_cap(info.get("marketCap"), market))
 
-                fig.update_layout(
-                    height=520,
-                    xaxis_title="날짜",
-                    yaxis_title="가격",
-                    hovermode="x unified"
-                )
 
-                st.plotly_chart(fig, use_container_width=True)
-
-            with col3:
-                st.subheader("관련 뉴스")
-
-                news = load_news(name)
-
-                if news:
-                    for item in news:
-                        with st.expander(item.title):
-                            st.write("뉴스 제목 기준 정리")
-                            title = item.title
-
-                            if "실적" in title or "영업이익" in title or "매출" in title:
-                                st.write("- 실적 관련 뉴스입니다.")
-                                st.write("- 매출과 이익 변화가 주가에 영향을 줄 수 있습니다.")
-                            elif "배당" in title:
-                                st.write("- 배당 관련 뉴스입니다.")
-                                st.write("- 배당 확대는 투자 심리에 긍정적일 수 있습니다.")
-                            elif "목표가" in title or "투자의견" in title:
-                                st.write("- 증권사 리포트 관련 뉴스입니다.")
-                                st.write("- 목표가 조정은 단기 주가에 영향을 줄 수 있습니다.")
-                            elif "반도체" in title or "AI" in title or "HBM" in title:
-                                st.write("- 산업 업황 관련 뉴스입니다.")
-                                st.write("- 관련 섹터 전체에 영향을 줄 수 있습니다.")
-                            elif "금리" in title or "환율" in title:
-                                st.write("- 거시경제 관련 뉴스입니다.")
-                                st.write("- 금리와 환율은 시장 전체에 영향을 줄 수 있습니다.")
-                            else:
-                                st.write("- 종목 또는 시장 분위기 관련 뉴스입니다.")
-                                st.write("- 제목만으로는 정확한 판단이 어려워 원문 확인이 필요합니다.")
-
-                            st.link_button("원문 보기", item.link)
-                else:
-                    st.write("관련 뉴스를 찾지 못했습니다.")
-
-        with tab2:
-            st.subheader("재무 / 배당")
-            info = load_financial(yf_symbol)
-
-            f1, f2, f3 = st.columns(3)
-            f1.metric("PER", info.get("trailingPE", "정보 없음"))
-            f2.metric("PBR", info.get("priceToBook", "정보 없음"))
-            f3.metric("ROE", f"{info.get('returnOnEquity', 0) * 100:.2f}%" if info.get("returnOnEquity") else "정보 없음")
-
-            f4, f5, f6 = st.columns(3)
-            f4.metric("배당률", f"{info.get('dividendYield', 0) * 100:.2f}%" if info.get("dividendYield") else "정보 없음")
-            f5.metric("배당금", info.get("dividendRate", "정보 없음"))
-            f6.metric("시가총액", info.get("marketCap", "정보 없음"))
-
-        st.caption("무료 데이터 기반 참고용입니다. 실제 투자 판단은 본인 책임입니다.")
-
+# =========================
+# 환율
+# =========================
 
 with tab3:
     st.subheader("금일 환율 / 최근 1개월 일별 환율")
@@ -425,45 +589,62 @@ with tab3:
     exchange_options = {
         "미국 달러 / 원": "KRW=X",
         "일본 엔 / 원": "JPYKRW=X",
-        "유로 / 원": "EURKRW=X"
+        "유로 / 원": "EURKRW=X",
+        "중국 위안 / 원": "CNYKRW=X"
     }
 
     selected_exchange = st.selectbox("환율 선택", list(exchange_options.keys()))
     symbol = exchange_options[selected_exchange]
 
-    ex_df = load_exchange_data(symbol)
+    daily_df, hourly_df = load_exchange_data(symbol)
 
-    if not ex_df.empty:
-        latest = ex_df.iloc[-1]
-        prev = ex_df.iloc[-2] if len(ex_df) >= 2 else latest
+    if not daily_df.empty:
+        latest_source = hourly_df if not hourly_df.empty else daily_df
+        latest = latest_source.iloc[-1]
 
-        change = latest["Close"] - prev["Close"]
-        change_rate = change / prev["Close"] * 100
+        prev = daily_df.iloc[-2] if len(daily_df) >= 2 else daily_df.iloc[-1]
+
+        latest_close = float(latest["Close"])
+        prev_close = float(prev["Close"])
+
+        change = latest_close - prev_close
+        change_rate = change / prev_close * 100
+
+        if selected_exchange == "일본 엔 / 원":
+            display_value = latest_close * 100
+            display_change = change * 100
+            unit_label = "100엔 기준"
+        else:
+            display_value = latest_close
+            display_change = change
+            unit_label = "1통화 기준"
 
         st.metric(
-            label=selected_exchange,
-            value=f"{latest['Close']:,.2f}원",
-            delta=f"{change:,.2f}원 / {change_rate:.2f}%"
+            label=f"{selected_exchange} ({unit_label})",
+            value=f"{display_value:,.2f}원",
+            delta=f"{display_change:,.2f}원 / {change_rate:.2f}%"
         )
 
+        st.caption("환율은 Yahoo Finance 무료 데이터 기준이며, 실제 은행 고시환율과 차이가 있을 수 있습니다.")
+
         fig_ex = go.Figure()
+        y_values = daily_df["Close"] * 100 if selected_exchange == "일본 엔 / 원" else daily_df["Close"]
+
         fig_ex.add_trace(go.Scatter(
-            x=ex_df.index,
-            y=ex_df["Close"],
+            x=daily_df.index,
+            y=y_values,
             mode="lines+markers",
             name=selected_exchange
         ))
 
-        fig_ex.update_layout(
-            height=450,
-            xaxis_title="날짜",
-            yaxis_title="환율",
-            hovermode="x unified"
-        )
-
+        fig_ex.update_layout(height=450, xaxis_title="날짜", yaxis_title="환율", hovermode="x unified")
         st.plotly_chart(fig_ex, use_container_width=True)
 
-        table_df = ex_df[["Open", "High", "Low", "Close"]].copy()
+        table_df = daily_df[["Open", "High", "Low", "Close"]].copy()
+
+        if selected_exchange == "일본 엔 / 원":
+            table_df = table_df * 100
+
         table_df = table_df.rename(columns={
             "Open": "시가",
             "High": "고가",
@@ -471,33 +652,39 @@ with tab3:
             "Close": "종가"
         })
 
-        st.dataframe(table_df.tail(30), use_container_width=True)
+        st.dataframe(table_df.tail(30).style.format("{:,.2f}"), use_container_width=True)
     else:
         st.warning("환율 데이터를 불러오지 못했습니다.")
 
+
+# =========================
+# 용어 설명
+# =========================
 
 with tab4:
     st.subheader("용어 설명")
 
     st.write("""
-### Close
-종가입니다. 해당 기간의 마지막 가격입니다.
-
-### MA5 / MA20 / MA60
-이동평균선입니다. 5선은 단기, 20선은 중기, 60선은 장기 흐름을 봅니다.
-
 ### RSI
 과매수/과매도 지표입니다. 70 이상은 과열, 30 이하는 과매도 구간입니다.
+
+### 거래량
+거래량이 평균보다 증가하면 시장 관심이 커졌다는 의미로 볼 수 있습니다.
 
 ### MACD
 추세 전환을 보는 지표입니다. MACD가 Signal 위면 상승 흐름 가능성이 있습니다.
 
-### 볼린저밴드
-가격의 변동 범위를 보는 지표입니다. 상단 근처는 과열, 하단 근처는 반등 가능성 구간으로 봅니다.
+### AI 점수
+이동평균선, RSI, MACD, 거래량 조건을 점수화한 참고용 지표입니다.
 
-### ATR
-평균 변동폭입니다. 목표가, 익절가, 손절가 참고값 계산에 사용했습니다.
+### 목표가 / 익절가 / 손절가
+ATR과 볼린저밴드를 활용한 참고값입니다.
+
+### 배당률
+현재 주가 대비 배당금 비율입니다.
 
 ### 환율
-원/달러 환율이 상승하면 수입 비용 부담이 커질 수 있고, 수출 기업에는 긍정적으로 작용할 수 있습니다.
+무료 데이터 기준이라 실제 은행 고시환율과 약간 차이가 있을 수 있습니다.
 """)
+
+st.caption(f"마지막 새로고침: {time.strftime('%Y-%m-%d %H:%M:%S')} / 3분마다 자동 갱신")
